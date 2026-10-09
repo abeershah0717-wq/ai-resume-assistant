@@ -18,6 +18,8 @@ import re
 from typing import Any
 
 import streamlit as st
+from google.genai import errors
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -27,6 +29,7 @@ import streamlit as st
 # model, so the app keeps working when older versions are retired.
 # You can override it in the sidebar or with the GEMINI_MODEL env var / secret.
 DEFAULT_MODEL = "gemini-flash-latest"
+FALLBACK_MODEL = "gemini-2.5-flash"  # Backup model if primary experiences high demand
 
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 30_000  # protects against huge files / token blow-ups
@@ -250,10 +253,31 @@ def normalize_result(data: dict) -> dict:
     }
 
 
+def _is_transient_error(exc: Exception) -> bool:
+    """Helper function to detect 503 UNAVAILABLE or 429 Rate Limit errors."""
+    if isinstance(exc, errors.APIError):
+        return exc.code in (503, 429) or "UNAVAILABLE" in str(exc)
+    err_msg = str(exc).lower()
+    return "503" in err_msg or "unavailable" in err_msg or "429" in err_msg
+
+
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=8),
+    retry=retry_if_exception(_is_transient_error),
+)
+def _generate_content_with_retry(client: Any, model: str, prompt: str, config: Any) -> Any:
+    """Internal helper to execute API call with 3 retries on 503 errors."""
+    return client.models.generate_content(
+        model=model, contents=prompt, config=config
+    )
+
+
 def analyze_resume(
     api_key: str, model: str, resume_text: str, job_description: str = ""
 ) -> dict:
-    """Call Gemini and return a validated analysis dict."""
+    """Call Gemini and return a validated analysis dict with auto-retry logic."""
     from google import genai
     from google.genai import types
 
@@ -266,14 +290,24 @@ def analyze_resume(
     prompt = build_prompt(resume_text, job_description)
 
     last_error: Exception | None = None
-    for _ in range(2):  # one retry if the JSON comes back malformed
-        response = client.models.generate_content(
-            model=model, contents=prompt, config=config
-        )
+    
+    # Try with requested model first, fall back to secondary model if still busy
+    for current_model in [model, FALLBACK_MODEL]:
         try:
-            return normalize_result(parse_model_json(response.text))
-        except (ValueError, json.JSONDecodeError) as exc:
+            for _ in range(2):  # one internal loop if JSON comes back malformed
+                response = _generate_content_with_retry(
+                    client, current_model, prompt, config
+                )
+                try:
+                    return normalize_result(parse_model_json(response.text))
+                except (ValueError, json.JSONDecodeError) as exc:
+                    last_error = exc
+        except Exception as exc:
             last_error = exc
+            if _is_transient_error(exc) and current_model != FALLBACK_MODEL:
+                continue  # Try fallback model on high demand failure
+            raise exc
+
     raise ValueError(f"Could not read the AI response ({last_error}). Please retry.")
 
 
@@ -282,6 +316,8 @@ def friendly_api_error(exc: Exception) -> str:
     low = msg.lower()
     if "api key" in low or "api_key" in low or "permission" in low or "401" in low or "403" in low:
         return "The Gemini API key was rejected. Please check that it is correct."
+    if "503" in low or "unavailable" in low:
+        return "Google Gemini servers are currently experiencing high demand. Please try again in 1-2 minutes."
     if "429" in low or "quota" in low or "resource_exhausted" in low:
         return "Gemini rate limit or quota reached. Wait a minute and try again."
     if "404" in low or "not found" in low:
@@ -425,7 +461,7 @@ def main() -> None:
             api_key = st.text_input(
                 "Gemini API key",
                 type="password",
-                help="Get a free key at https://aistudio.google.com/apikey",
+                help="Get a free key at [https://aistudio.google.com/apikey](https://aistudio.google.com/apikey)",
             ).strip()
         model = st.text_input(
             "Gemini model", value=get_secret("GEMINI_MODEL") or DEFAULT_MODEL
@@ -474,7 +510,7 @@ def main() -> None:
             return
 
         try:
-            with st.spinner("Analyzing with Gemini..."):
+            with st.spinner("Analyzing with Gemini... (will automatically retry if servers are busy)"):
                 st.session_state["result"] = analyze_resume(
                     api_key, model, text, job_description
                 )
